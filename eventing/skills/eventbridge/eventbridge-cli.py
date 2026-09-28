@@ -10,6 +10,7 @@ Stdlib-only — safe to run under `python3` or `uv run python`. No deps.
 import argparse
 import json
 import os
+import pathlib
 import shlex
 import sys
 import time
@@ -73,16 +74,64 @@ def _add_target_flags(sp):
                          "http://127.0.0.1:8080). A bare hostname is assumed https.")
 
 
+def _token_path() -> pathlib.Path:
+    """Where `login` stores the GitHub token.
+
+    XDG if set, else ~/.config — the same place the rest of a user's CLI state
+    lives, so it is findable and deletable without documentation.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return pathlib.Path(base) / "rossoctl-eventing" / "token"
+
+
+def _read_token() -> str | None:
+    """The stored token, or $EVENTBRIDGE_TOKEN, or None.
+
+    The environment wins: a CI job or a one-off shell should be able to act as a
+    different identity without disturbing an interactive login.
+    """
+    env = os.environ.get("EVENTBRIDGE_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        tok = _token_path().read_text().strip()
+        return tok or None
+    except OSError:
+        return None
+
+
 def _req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
+    headers = {}
+    if body:
+        headers["Content-Type"] = "application/json"
+    token = _read_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        BASE + path, data=data, method=method,
-        headers={"Content-Type": "application/json"} if body else {},
+        BASE + path, data=data, method=method, headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as e:
+        # 401 and 403 are the two an operator will actually hit, and they mean
+        # different things. A traceback for either sends someone reading urllib
+        # internals instead of fixing their access.
+        if e.code in (401, 403):
+            try:
+                detail = json.loads(e.read() or b"{}").get("error", "")
+            except Exception:  # noqa: BLE001
+                detail = ""
+            if e.code == 401:
+                print(f"✗ not signed in{': ' + detail if detail else ''}\n"
+                      f"  run:  {sys.argv[0]} login", file=sys.stderr)
+            else:
+                print(f"✗ signed in, but not authorised"
+                      f"{': ' + detail if detail else ''}\n"
+                      f"  ask an operator to add you to EB_ALLOWED_USERS",
+                      file=sys.stderr)
+            raise SystemExit(1) from None
         raise
     except OSError as e:
         # Nothing listening, or the name does not resolve. Say what to change rather
@@ -443,6 +492,87 @@ def cmd_selftest(args):
             print(f"      · {note}")
 
 
+# ---- sign-in ----------------------------------------------------------------
+
+# The OAuth App client id is PUBLIC: the device flow has no client secret, which
+# is why this can be a default in source. Override for a different app.
+DEFAULT_GITHUB_CLIENT_ID = "Ov23liA2Z4jfbFRoJKZn"
+
+
+def cmd_login(args):
+    """GitHub device flow: print a code, wait for the browser, store the token.
+
+    Deliberately prints the code and the URL and then blocks. The alternative —
+    opening a browser automatically — fails silently over SSH and in a container,
+    which is where this is most often run.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+    from eventbridge import ghauth
+
+    client_id = args.client_id or os.environ.get(
+        "EB_GITHUB_CLIENT_ID") or DEFAULT_GITHUB_CLIENT_ID
+    try:
+        start = ghauth.start_device_flow(client_id)
+    except RuntimeError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+    print(f"\n  Open {start.get('verification_uri', ghauth.VERIFICATION_URL)}")
+    print(f"  Enter code: {start['user_code']}\n")
+    print("  Waiting for you to authorise in the browser (Ctrl-C to abort)...")
+
+    try:
+        token = ghauth.poll_for_token(
+            client_id, start["device_code"],
+            interval=start.get("interval"),
+            expires_in=float(start.get("expires_in", 900)))
+    except KeyboardInterrupt:
+        print("\n✗ aborted", file=sys.stderr)
+        raise SystemExit(130) from None
+    except (RuntimeError, TimeoutError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+    login, err = ghauth.fetch_login(token)
+    if login is None:
+        print(f"✗ signed in, but could not read the account: {err}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+    dest = _token_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(token)
+    dest.chmod(0o600)          # a token is a credential; not world-readable
+    print(f"✔ signed in as {login}")
+    print(f"  token stored at {dest} (mode 600)")
+
+
+def cmd_logout(args):
+    """Forget the stored token. Does not revoke it on GitHub."""
+    dest = _token_path()
+    try:
+        dest.unlink()
+        print(f"✔ removed {dest}")
+    except FileNotFoundError:
+        print("• no stored token")
+    print("  to revoke access entirely: https://github.com/settings/applications")
+
+
+def cmd_whoami(args):
+    """Who the stored token belongs to, asked of GitHub rather than assumed."""
+    token = _read_token()
+    if not token:
+        print("• not signed in", file=sys.stderr)
+        raise SystemExit(1)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+    from eventbridge import ghauth
+    login, err = ghauth.fetch_login(token)
+    if login is None:
+        print(f"✗ {err}", file=sys.stderr)
+        raise SystemExit(1)
+    src = "$EVENTBRIDGE_TOKEN" if os.environ.get("EVENTBRIDGE_TOKEN") else str(_token_path())
+    print(f"✔ {login}  (token from {src})")
+
+
 def cmd_chat(args):
     r = _req("GET", f"/v0/agents/{args.correlationid}/turns")
     print(f"correlationid: {r['correlationid']}  {len(r['turns'])} turns  final={r['final']}")
@@ -503,6 +633,18 @@ def main():
         description="Drive EventBridge — run/continue/watch/chat with a Claude agent.",
     )
     sub = p.add_subparsers(dest="op", required=True)
+
+    li = sub.add_parser("login", help="sign in with GitHub (device flow)")
+    li.add_argument("--client-id", default=None, metavar="ID",
+                    help="OAuth App client id (default: $EB_GITHUB_CLIENT_ID, "
+                         "else the built-in demo app)")
+    li.set_defaults(fn=cmd_login)
+
+    lo = sub.add_parser("logout", help="forget the stored token")
+    lo.set_defaults(fn=cmd_logout)
+
+    wai = sub.add_parser("whoami", help="show who the stored token belongs to")
+    wai.set_defaults(fn=cmd_whoami)
 
     r = sub.add_parser("run", help="start an agent with a prompt and print its reply")
     r.add_argument("prompt")

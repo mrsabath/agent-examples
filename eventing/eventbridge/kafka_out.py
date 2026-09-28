@@ -25,6 +25,7 @@ class Producer:
         subject: str = "agent-request",
         groupid: str | None = None,
         submitter: str | None = None,
+        submitter_iss: str | None = None,
     ) -> str:
         event = ce.new_event(
             type=ce.TYPE_REQUEST,
@@ -37,6 +38,7 @@ class Producer:
             data={"prompt": prompt, "model": model, "max_turns": max_turns},
             **({"groupid": groupid} if groupid else {}),
             **({ce.EXT_SUBMITTER: submitter} if submitter else {}),
+            **({ce.EXT_SUBMITTER_ISS: submitter_iss} if submitter_iss else {}),
         )
         headers, value = ce.to_kafka_binary(event)
         future = self._prod.send(self._topic, key=correlationid.encode(), value=value, headers=headers)

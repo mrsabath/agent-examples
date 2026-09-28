@@ -56,7 +56,8 @@ class GroupService:
 
     def submit_members(self, groupid: str, prompts: list[str], *,
                        max_turns: int = 3, model: str | None = None,
-                       submitter: str | None = None) -> list[str]:
+                       submitter: str | None = None,
+                       submitter_iss: str | None = None) -> list[str]:
         """Publish every member's request, recording membership first.
 
         Membership is recorded BEFORE the request is published so a fast agent's
@@ -74,7 +75,7 @@ class GroupService:
             self.producer.publish_request(
                 prompt=prompt, correlationid=corr, sessionuuid=sess, mode="start",
                 model=model, max_turns=max_turns, subject="start", groupid=groupid,
-                submitter=submitter)
+                submitter=submitter, submitter_iss=submitter_iss)
             corrs.append(corr)
         return corrs
 

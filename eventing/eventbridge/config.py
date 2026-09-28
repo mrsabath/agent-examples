@@ -6,7 +6,7 @@ import pathlib
 import tomllib
 from dataclasses import dataclass, field
 
-from eventbridge import auth
+from eventbridge import auth, ghauth
 
 
 @dataclass
@@ -47,6 +47,17 @@ class Cfg:
     # only via EB_AUTH_TOKENS — deliberately never read from config.toml, which
     # is committed (tests/test_manifests.py pins the same rule for NTFY_TOKEN).
     auth_tokens: dict[str, str] = field(default_factory=dict)
+    # GitHub sign-in. The client id is PUBLIC — the OAuth device flow has no
+    # client secret, which is why it can be committed while an ntfy topic cannot.
+    github_client_id: str = ""
+    # Who may submit. Empty means nobody is approved: if GitHub sign-in is
+    # configured at all, an operator has to say who may use it, because the other
+    # reading ("empty means everybody") turns a missing variable into an open door.
+    allowed_users: frozenset[str] = frozenset()
+    # Token -> login lookups are cached for this long. Not an optimisation: a
+    # GitHub API call per request would spend a 5000/hour budget and add GitHub's
+    # latency to the request path.
+    github_cache_ttl_s: float = 300.0
     ntfy: NtfyCfg = field(default_factory=NtfyCfg)
 
 
@@ -78,6 +89,11 @@ def load() -> Cfg:
             phases=tuple(n.get("phases", cfg.ntfy.phases)),
         )
         cfg.public_base_url = n.get("public_base_url", cfg.public_base_url)
+        g = d.get("github", {})
+        cfg.github_client_id = g.get("client_id", cfg.github_client_id)
+        if g.get("allowed_users"):
+            cfg.allowed_users = frozenset(
+                str(u).strip().lower() for u in g["allowed_users"] if str(u).strip())
 
     # env overrides
     e = os.environ.get
@@ -98,6 +114,12 @@ def load() -> Cfg:
     auth_env = e("EB_AUTH_TOKENS")
     if auth_env:
         cfg.auth_tokens = auth.parse_tokens(auth_env)
+    cfg.github_client_id = e("EB_GITHUB_CLIENT_ID", cfg.github_client_id)
+    allowed_env = e("EB_ALLOWED_USERS")
+    if allowed_env:
+        cfg.allowed_users = ghauth.parse_allowed_users(allowed_env)
+    cfg.github_cache_ttl_s = float(e("EB_GITHUB_CACHE_TTL_S",
+                                     str(cfg.github_cache_ttl_s)))
 
     cfg.ntfy.enabled  = (e("NTFY_ENABLED", "true" if cfg.ntfy.enabled else "false").lower() == "true")
     cfg.ntfy.base_url = e("NTFY_BASE_URL", cfg.ntfy.base_url)

@@ -46,6 +46,10 @@ EXT_GROUPID       = "groupid"
 # and forgeable by anyone with write access to the requests topic — it records
 # who EventBridge believes submitted, not cryptographic proof.
 EXT_SUBMITTER     = "submitter"
+# Who vouched for EXT_SUBMITTER: "github" when the login came from a verified
+# GitHub sign-in, absent when it came from a static token. Without this a reader
+# cannot tell a real identity from a name an operator typed into an env var.
+EXT_SUBMITTER_ISS = "submitter_iss"
 
 CE_HEADER_PREFIX = "ce_"
 CORE_ATTRS = {"specversion", "type", "source", "id", "time",

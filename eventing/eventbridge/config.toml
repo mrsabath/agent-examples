@@ -14,3 +14,11 @@ topic    = ""
 token    = ""
 phases   = ["result", "error"]
 public_base_url = "http://127.0.0.1:8080"
+
+[github]
+# The OAuth App client id is public: the device flow has no client secret, so
+# unlike an ntfy topic this is safe to commit. Override with EB_GITHUB_CLIENT_ID.
+client_id = ""
+# Who may submit. Empty means nobody, so sign-in stays off until an operator
+# names the approved logins. Override with EB_ALLOWED_USERS.
+allowed_users = []

@@ -9,7 +9,7 @@ from typing import Any
 
 from shared import ce
 
-from eventbridge import auth
+from eventbridge import auth, ghauth
 from eventbridge.config import Cfg
 from eventbridge.correlation import REGEX as CORR_REGEX
 from eventbridge.correlation import Minter
@@ -62,8 +62,15 @@ def _read_body(environ, limit: int) -> tuple[bytes | None, str | None]:
     return body, None
 
 
-def _deny(start_response, reason: str) -> list[bytes]:
-    """401 with the Bearer challenge. `_json` already takes extra headers."""
+def _deny(start_response, reason: str, status: int = 401) -> list[bytes]:
+    """Refuse with 401 or 403. `_json` already takes extra headers.
+
+    The challenge header goes on 401 only. On a 403 the credential was fine and
+    retrying with a different one is not the remedy, so advertising a scheme
+    would be misleading.
+    """
+    if status == 403:
+        return _json(start_response, "403 Forbidden", {"error": reason})
     return _json(start_response, "401 Unauthorized", {"error": reason},
                  [("WWW-Authenticate", auth.CHALLENGE)])
 
@@ -92,12 +99,15 @@ class Handlers:
         self.producer = producer
         self.minter = minter
         self.groups = groups
+        # One cache for the process, so a burst of requests from the same user
+        # costs one GitHub call rather than one each.
+        self.logins = ghauth.LoginCache(cfg.github_cache_ttl_s)
 
     # ---- start ----
     def start_agent(self, environ, start_response, **_):
-        submitter, why = auth.resolve_identity(environ, self.cfg.auth_tokens)
-        if why:
-            return _deny(start_response, why)
+        submitter, sub_iss, status, why = auth.resolve(environ, self.cfg, cache=self.logins)
+        if status:
+            return _deny(start_response, why, status)
         body = _read_json(environ)
         prompt = body.get("prompt")
         if not prompt:
@@ -121,7 +131,7 @@ class Handlers:
         event_id = self.producer.publish_request(
             prompt=prompt, correlationid=corr, sessionuuid=sess,
             mode="start", model=model, max_turns=max_turns, subject="start",
-            groupid=groupid, submitter=submitter,
+            groupid=groupid, submitter=submitter, submitter_iss=sub_iss,
         )
         out = {
             "correlationid": corr, "sessionuuid": sess,
@@ -142,9 +152,9 @@ class Handlers:
         the batch scale at all: every request is published before any is watched, so
         lag reaches N and KEDA scales past one pod.
         """
-        submitter, why = auth.resolve_identity(environ, self.cfg.auth_tokens)
-        if why:
-            return _deny(start_response, why)
+        submitter, sub_iss, status, why = auth.resolve(environ, self.cfg, cache=self.logins)
+        if status:
+            return _deny(start_response, why, status)
         if self.groups is None:
             return _json(start_response, "503 Service Unavailable",
                          {"error": "group support not enabled"})
@@ -180,7 +190,7 @@ class Handlers:
         corrs = self.groups.submit_members(
             groupid, [str(x) for x in prompts],
             max_turns=int(body.get("max_turns", 3)), model=body.get("model"),
-            submitter=submitter)
+            submitter=submitter, submitter_iss=sub_iss)
         return _json(start_response, "202 Accepted", {
             "groupid": groupid, "created": True, "expected": expected or len(corrs),
             "members": corrs,
